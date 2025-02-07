@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
     const CONCURRENT_EXTRACT: usize = 4;
     const CONCURRENT_DOWNLOAD: usize = 10;
 
-    let Args { format, input, output } = Args::parse();
+    let Args { format, mode, input, output } = Args::parse();
 
     let output = output.unwrap_or_else(|| input.clone());
 
@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
             .context("Failed to build reqwest client")?;
         
         let extraction_task = task::spawn_blocking(move || {
-            parallel_extract_gz(gz_files, sender, CONCURRENT_EXTRACT)
+            parallel_extract_gz(gz_files, sender, CONCURRENT_EXTRACT, mode)
         });
 
         let download_task = task::spawn(async move {
@@ -69,6 +69,8 @@ async fn main() -> Result<()> {
 struct Args {
     #[arg(long, short)]
     format: String,
+    #[arg(long, short)]
+    mode: u8,
     #[arg(long, short)]
     input: String,
     #[arg(long, short)]

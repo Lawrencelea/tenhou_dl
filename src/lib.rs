@@ -5,7 +5,7 @@ use serde_json::Value;
 use reqwest::Client;
 use tokio::sync::mpsc;
 use url::Url;
-use scraper::{Html, Selector};
+// use scraper::{Html, Selector};
 use regex::Regex;
 use futures::stream::StreamExt;
 
@@ -103,7 +103,7 @@ pub async fn download_json(client: &Client, url: String, path: &str) -> Result<(
     save_json(&json, path).await
 }
 
-fn process_gz(path: &str, sender: &mpsc::Sender<String>) -> Result<()> {
+fn process_gz(path: &str, sender: &mpsc::Sender<String>, mode: u8) -> Result<()> {
     let gz = File::open(path)
         .context(format!("Failed to open file {}", path))?;
     let mut decoder = GzDecoder::new(&gz);
@@ -112,7 +112,7 @@ fn process_gz(path: &str, sender: &mpsc::Sender<String>) -> Result<()> {
     decoder.read_to_string(&mut content)
         .context(format!("Failed to unarchive file {}", path))?;
 
-    extract_urls(&content)?
+    extract_urls(&content, mode)?
         .into_iter()
         .map(|id| id_to_link(&id))
         .try_for_each(|url| {
@@ -125,6 +125,7 @@ pub fn parallel_extract_gz(
     files: Vec<String>,
     sender: mpsc::Sender<String>,
     concurrency: usize,
+    mode: u8,
 ) -> Result<()> {
 
     let pool = rayon::ThreadPoolBuilder::new()
@@ -136,7 +137,7 @@ pub fn parallel_extract_gz(
         for path in files {
             let sender = sender.clone();
             s.spawn(move |_| {
-                if let Err(e) = process_gz(&path, &sender) {
+                if let Err(e) = process_gz(&path, &sender, mode) {
                     eprintln!("Error when processing {}: {:?}", path, e);
                 }
             });
@@ -184,19 +185,48 @@ pub async fn process_downloads(
     Ok(())
 }
 
-fn extract_urls(html: &str) -> Result<Vec<String>> {
-    let mut ids = Vec::new();
-    let document = Html::parse_document(html);
-    let selector = Selector::parse("a[href]").unwrap();
-    let log_regex = Regex::new(r#"log=([^"]+)"#)?;
+// fn extract_urls(html: &str, mode: u8) -> Result<Vec<String>> {
+//     let mut ids = Vec::new();
+//     let document = Html::parse_document(html);
+//     let selector = Selector::parse("a[href]").unwrap();
+//     let log_regex = Regex::new(r#"log=([^"]+)"#)?;
+
+//     let name = match mode {
+//         3 => "三鳳南喰赤",
+//         4 => "四鳳南喰赤",
+//     }
     
-    for element in document.select(&selector) {
-        if let Some(href) = element.value().attr("href") {
-            if let Some(caps) = log_regex.captures(href) {
+//     for element in document.select(&selector) {
+//         if let Some(href) = element.value().attr("href") {
+//             let full_line = element.parent().unwrap().html();
+            
+//             if let Some(caps) = log_regex.captures(href) {
+//                 ids.push(caps[1].to_string());
+//             }
+//         }
+//     }
+//     Ok(ids)
+// }
+
+fn extract_urls(html: &str, mode: u8) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+
+    let log_regex = Regex::new(r#"log=([^"]+)"#)?;
+
+    let name = match mode {
+        3 => "三鳳南喰赤",
+        4 => "四鳳南喰赤",
+        _ => return Err(anyhow::anyhow!("Invalid mode")),
+    };
+    
+    for line in html.lines() {
+        if line.contains(name) {
+            if let Some(caps) = log_regex.captures(line) {
                 ids.push(caps[1].to_string());
             }
         }
     }
+
     Ok(ids)
 }
 
@@ -325,17 +355,17 @@ mod tests {
 00:09 | 26 | 三鳳南喰赤－ | <a href="http://tenhou.net/0/?log=2024010100gm-00b9-0000-2aeaa442">牌譜</a> | 誤作動(+39.8) 春風送福(-5.7) 賀喜遥香.(-34.1)<br>"#;
 
 
-    let ids = extract_urls(html).unwrap();
+    let ids = extract_urls(html, 3).unwrap();
     let expected = vec![
-        "2024010100gm-00a9-0000-8a068807".to_string(),
+        // "2024010100gm-00a9-0000-8a068807".to_string(),
         "2024010100gm-00b9-0000-6d566765".to_string(),
-        "2024010100gm-00a9-0000-fdcc9588".to_string(),
+        // "2024010100gm-00a9-0000-fdcc9588".to_string(),
         "2024010100gm-00b9-0000-9952348d".to_string(),
-        "2024010100gm-00a9-0000-446cb297".to_string(),
-        "2024010100gm-00a9-0000-aaf331f9".to_string(),
-        "2024010100gm-00a9-0000-11710264".to_string(),
+        // "2024010100gm-00a9-0000-446cb297".to_string(),
+        // "2024010100gm-00a9-0000-aaf331f9".to_string(),
+        // "2024010100gm-00a9-0000-11710264".to_string(),
         "2024010100gm-00b9-0000-c7cf4e5c".to_string(),
-        "2024010100gm-00a9-0000-ae1f7070".to_string(),
+        // "2024010100gm-00a9-0000-ae1f7070".to_string(),
         "2024010100gm-00b9-0000-2aeaa442".to_string(),
     ];
     assert_eq!(ids, expected);
