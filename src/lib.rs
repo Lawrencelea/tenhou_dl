@@ -169,12 +169,11 @@ pub async fn process_downloads(
 
     while let Some(result) = stream.next().await {
         match result {
-            Ok(url) => {
+            Ok(_) => {
                 success_count += 1;
                 if success_count % 100 == 0 {
-                    println!("Downloaded: {}", url);
+                    println!("Downloaded: {}", success_count);
                 }
-                println!("Downloaded: {}", url);
             }
             Err(_) => {
                 error_count += 1;

@@ -16,12 +16,15 @@ use tokio::{sync::mpsc::{self},
 #[tokio::main]
 async fn main() -> Result<()> {
 
-    const CONCURRENT_EXTRACT: usize = 4;
-    const CONCURRENT_DOWNLOAD: usize = 10;
+    let Args { format, mode, 
+        input, output, 
+        extract, download } = Args::parse();
 
-    let Args { format, mode, input, output } = Args::parse();
-
-    let output = output.unwrap_or_else(|| input.clone());
+    let output = output.unwrap_or_else(|| input.clone() + "_output");
+    let concurent_extract = extract.unwrap_or(4);
+    let concurent_download = download.unwrap_or(10);
+    let format = format.unwrap_or("gz".to_string());
+    let mode = mode.unwrap_or(3);
 
     if format == "mjlog" {
         let urls = get_filename_list(&input)
@@ -47,11 +50,11 @@ async fn main() -> Result<()> {
             .context("Failed to build reqwest client")?;
         
         let extraction_task = task::spawn_blocking(move || {
-            parallel_extract_gz(gz_files, sender, CONCURRENT_EXTRACT, mode)
+            parallel_extract_gz(gz_files, sender, concurent_extract, mode)
         });
 
         let download_task = task::spawn(async move {
-            process_downloads(receiver, &client, CONCURRENT_DOWNLOAD, &output).await
+            process_downloads(receiver, &client, concurent_download, &output).await
         });
 
         let _ = extraction_task.await?;
@@ -68,11 +71,15 @@ async fn main() -> Result<()> {
 #[command(name = "Tenhou downloader")]
 struct Args {
     #[arg(long, short)]
-    format: String,
+    format: Option<String>,
     #[arg(long, short)]
-    mode: u8,
+    mode: Option<u8>,
     #[arg(long, short)]
     input: String,
     #[arg(long, short)]
     output: Option<String>,
+    #[arg(long, short)]
+    extract: Option<usize>,
+    #[arg(long, short)]
+    download: Option<usize>,
 }
