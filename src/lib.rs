@@ -1,6 +1,13 @@
-use std::{path::{PathBuf, Path}, fs::File, io::Write};
+use std::{fs::File, io::Read, path::{Path, PathBuf}};
+use anyhow::{Context, Result};
+use flate2::read::GzDecoder;
 use serde_json::Value;
 use reqwest::Client;
+use tokio::sync::mpsc;
+use url::Url;
+use scraper::{Html, Selector};
+use regex::Regex;
+use futures::stream::StreamExt;
 
 
 pub fn filename_to_id(filename: &str) -> Option<String> {
@@ -29,34 +36,168 @@ pub fn get_filename_list(path: &str) -> Vec<String> {
     filenames
 }
 
-pub async fn fetch_json(client: &Client, url: &str) -> Result<Value, Box<dyn std::error::Error>> {
+pub fn get_gz_files(path: &str) -> Vec<String> {
+    let mut filenames = Vec::new();
+    let path = PathBuf::from(path);
+    for entry in path.read_dir().unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.is_file() {
+            if let Ok(abs_path) = path.canonicalize() {
+                if let Some(filename) = abs_path.to_str() {
+                    if filename.ends_with(".gz") {
+                        filenames.push(filename.to_string());
+                    }
+                }
+            }
+        }
+    }
+    // dbg!(&filenames);
+    filenames
+}
 
-    let response = client.get(url).send().await?.text().await?;
+pub async fn fetch_json(client: &Client, url: &str) -> Result<Value> {
+    let url = Url::parse(url)
+        .context(format!("Invalid url: {}", url))?;
+
+    let response = client.get(url.clone())
+        .send().await //.text().await?;
+        .context(format!("Failed to request: {}", url))?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!("Error status: {}", response.status()));
+    }
+
+    let content = response.text().await
+        .context(format!("Failed to read response: {}", url))?;
     // dbg!(&response);
-    let json: Value = serde_json::from_str(&response)?;
+    let json: Value = serde_json::from_str(&content)?;
     
     Ok(json)
 }
 
-pub fn save_json(json: &Value, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn save_json(json: &Value, path: &str) -> Result<()> {
     let filename = json.get("ref")
-        .and_then(Value::as_str)
-        .ok_or("Invalid json")?;
-    // dbg!(filename);
-    let json_str = serde_json::to_string_pretty(json)?;
-    let filepath = Path::new(path).join(format!("{}.json", filename));
-    // dbg!(&filepath);
-    if let Some(parent) = filepath.parent() {
-        std::fs::create_dir_all(parent)?;
+        .and_then(Value::as_str);
+
+    if let Some(filename) = filename {
+        // dbg!(filename);
+        let json_str = serde_json::to_string_pretty(json)?;
+        let filepath = Path::new(path).join(format!("{}.json", filename));
+        // dbg!(&filepath);
+        if let Some(parent) = filepath.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        
+        tokio::fs::write(filepath, json_str)
+            .await
+            .context(format!("Failed to write json {}", filename))?;
     }
-    let mut file = File::create(filepath)?;
-    file.write_all(json_str.as_bytes())?;
+    
+
     Ok(())
 }
 
-pub async fn download_json(client: &Client, url: String, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn download_json(client: &Client, url: String, path: &str) -> Result<()> {
     let json = fetch_json(client, &url).await?;
-    save_json(&json, path)
+    save_json(&json, path).await
+}
+
+fn process_gz(path: &str, sender: &mpsc::Sender<String>) -> Result<()> {
+    let gz = File::open(path)
+        .context(format!("Failed to open file {}", path))?;
+    let mut decoder = GzDecoder::new(&gz);
+
+    let mut content = String::new();
+    decoder.read_to_string(&mut content)
+        .context(format!("Failed to unarchive file {}", path))?;
+
+    extract_urls(&content)?
+        .into_iter()
+        .map(|id| id_to_link(&id))
+        .try_for_each(|url| {
+            sender.blocking_send(url)
+                .context("Failed to send url")
+        })
+}
+
+pub fn parallel_extract_gz(
+    files: Vec<String>,
+    sender: mpsc::Sender<String>,
+    concurrency: usize,
+) -> Result<()> {
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(concurrency)
+        .build()
+        .context("Failed to build thread pool")?;
+
+    pool.scope(|s| {
+        for path in files {
+            let sender = sender.clone();
+            s.spawn(move |_| {
+                if let Err(e) = process_gz(&path, &sender) {
+                    eprintln!("Error when processing {}: {:?}", path, e);
+                }
+            });
+        }
+    });
+    Ok(())
+}
+
+pub async fn process_downloads(
+    receiver: mpsc::Receiver<String>,
+    client: &Client,
+    concurrency: usize,
+    output: &str,
+) -> Result<()> {
+    let mut success_count = 0;
+    let mut error_count = 0;
+
+    let mut stream = tokio_stream::wrappers::ReceiverStream::new(receiver)
+        .map(|url| async move {
+            match download_json(client, url.clone(), output).await {
+                Ok(_) => Ok(url),
+                Err(e) => {
+                    eprintln!("Error when downloading {}: {:?}", url, e);
+                    Err(e)
+                }
+            } 
+        })
+        .buffered(concurrency);
+
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(url) => {
+                success_count += 1;
+                if success_count % 100 == 0 {
+                    println!("Downloaded: {}", url);
+                }
+                println!("Downloaded: {}", url);
+            }
+            Err(_) => {
+                error_count += 1;
+            }
+        }
+    }
+    println!("Downloaded: {}, Failed: {}", success_count, error_count);
+    Ok(())
+}
+
+fn extract_urls(html: &str) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+    let document = Html::parse_document(html);
+    let selector = Selector::parse("a[href]").unwrap();
+    let log_regex = Regex::new(r#"log=([^"]+)"#)?;
+    
+    for element in document.select(&selector) {
+        if let Some(href) = element.value().attr("href") {
+            if let Some(caps) = log_regex.captures(href) {
+                ids.push(caps[1].to_string());
+            }
+        }
+    }
+    Ok(ids)
 }
 
 #[cfg(test)]
@@ -112,6 +253,37 @@ mod tests {
         assert_eq!(filenames, expected);
     }
 
+    #[test]
+    fn test_get_gz_files() {
+
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let file1 = dir_path.join("2018081112gm-0059-0000-9a8ab626&tw=0.gz");
+        let file2 = dir_path.join("2018081202gm-0059-0000-09ca0cf7&tw=0.gz");
+        let file3 = dir_path.join("2018081600gm-0011-0000-9a1eaf0d&tw=1.gz"); 
+        let file4 = dir_path.join("2018081302gm-0051-0000-397db08d&tw=1.gz");
+
+        File::create(&file1).unwrap();
+        File::create(&file2).unwrap();
+        File::create(&file3).unwrap();
+        File::create(&file4).unwrap();
+
+        let mut filenames = get_gz_files(dir_path.to_str().unwrap());
+        filenames.sort();
+
+        let mut expected = vec![
+            "2018081112gm-0059-0000-9a8ab626&tw=0.gz".to_string(),
+            "2018081202gm-0059-0000-09ca0cf7&tw=0.gz".to_string(),
+            "2018081600gm-0011-0000-9a1eaf0d&tw=1.gz".to_string(),
+            "2018081302gm-0051-0000-397db08d&tw=1.gz".to_string(),
+        ];
+
+        expected.sort();
+
+        assert_eq!(filenames, expected);
+    }
+
     #[tokio::test]
     async fn test_fetch_json() {
         let mock_server = MockServer::start().await;
@@ -138,6 +310,36 @@ mod tests {
         println!("Response Body: {}", json);
 
     }
+
+    #[test]
+    fn test_extract_urls() {
+        let html = r#"00:01 | 26 | 四鳳南喰赤－ | <a href="http://tenhou.net/0/?log=2024010100gm-00a9-0000-8a068807">牌譜</a> | 笹野理一(+55.8) 笹餅(-0.5) ミラーねじ(-21.4) ＠次男(-33.9)<br>
+00:01 | 14 | 三鳳南喰赤－ | <a href="http://tenhou.net/0/?log=2024010100gm-00b9-0000-6d566765">牌譜</a> | 雀極のへ(+50.3) R.PT(+13.8) 京都のリーチ超人(-64.1)<br>
+00:02 | 15 | 四鳳南喰赤－ | <a href="http://tenhou.net/0/?log=2024010100gm-00a9-0000-fdcc9588">牌譜</a> | はるか！春を呼ぶ(+59.2) 東方定助(+17.2) こてる(-20.6) ささり(-55.8)<br>
+00:04 | 18 | 三鳳南喰赤－ | <a href="http://tenhou.net/0/?log=2024010100gm-00b9-0000-9952348d">牌譜</a> | らくた(+57.3) mtk(-12.9) ヨッシー9zde(-44.4)<br>
+00:05 | 30 | 四鳳南喰赤－ | <a href="http://tenhou.net/0/?log=2024010100gm-00a9-0000-446cb297">牌譜</a> | makit123(+76.6) 宮保鶏肉(-2.9) bakura08(-31.8) 御影ゆずき(-41.9)<br>
+00:05 | 33 | 四鳳南喰赤－ | <a href="http://tenhou.net/0/?log=2024010100gm-00a9-0000-aaf331f9">牌譜</a> | 琴寄文乃(+57.8) モンキートリック(+16.0) オフショアガール(-25.0) tanpin8(-48.8)<br>
+00:06 | 30 | 四鳳南喰赤－ | <a href="http://tenhou.net/0/?log=2024010100gm-00a9-0000-11710264">牌譜</a> | suzume3(+40.7) 湘北⑭三井寿(+7.8) 馬座標胤舜(-16.8) てんくう(-31.7)<br>
+00:07 | 16 | 三鳳南喰赤－ | <a href="http://tenhou.net/0/?log=2024010100gm-00b9-0000-c7cf4e5c">牌譜</a> | 樽なの壊さないで(+44.1) アサ3(+2.9) 鳴き麻雀(-47.0)<br>
+00:08 | 32 | 四鳳南喰赤－ | <a href="http://tenhou.net/0/?log=2024010100gm-00a9-0000-ae1f7070">牌譜</a> | 憤怒鳥(+42.3) Aria(+8.3) うずめ改弐(-15.3) Halfs(-35.3)<br>
+00:09 | 26 | 三鳳南喰赤－ | <a href="http://tenhou.net/0/?log=2024010100gm-00b9-0000-2aeaa442">牌譜</a> | 誤作動(+39.8) 春風送福(-5.7) 賀喜遥香.(-34.1)<br>"#;
+
+
+    let ids = extract_urls(html).unwrap();
+    let expected = vec![
+        "2024010100gm-00a9-0000-8a068807".to_string(),
+        "2024010100gm-00b9-0000-6d566765".to_string(),
+        "2024010100gm-00a9-0000-fdcc9588".to_string(),
+        "2024010100gm-00b9-0000-9952348d".to_string(),
+        "2024010100gm-00a9-0000-446cb297".to_string(),
+        "2024010100gm-00a9-0000-aaf331f9".to_string(),
+        "2024010100gm-00a9-0000-11710264".to_string(),
+        "2024010100gm-00b9-0000-c7cf4e5c".to_string(),
+        "2024010100gm-00a9-0000-ae1f7070".to_string(),
+        "2024010100gm-00b9-0000-2aeaa442".to_string(),
+    ];
+    assert_eq!(ids, expected);
+}
 
     #[test]
     fn test_json() {
